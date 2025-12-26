@@ -448,7 +448,7 @@ class CalculatorApp:
             self.display.delete(0, tk.END)
             self.display.insert(0, result_str)
 
-    # ---------------- HISTORY ----------------
+        # ---------------- HISTORY ----------------
 
     def open_history_window(self):
         if self.history_window is not None and tk.Toplevel.winfo_exists(self.history_window):
@@ -491,5 +491,22 @@ class CalculatorApp:
             return
         self.history_listbox.delete(0, tk.END)
         for expr, res, mode in self.history:
-    self.history_listbox.insert(tk.END, f"[{mode}] {expr} = {res}")
+            self.history_listbox.insert(tk.END, f"[{mode}] {expr} = {res}")
 
+    def on_history_double_click(self, event):
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+        index = len(self.history) - 1 - selection[0]
+        expr, res, mode = self.history[index]
+        self.display.delete(0, tk.END)
+        self.display.insert(0, expr)
+        self.mode_label.config(text=f"Modus: {mode}")
+
+
+# ============================================================
+#  MINI‑OS START (anstelle von Tk() + mainloop())
+# ============================================================
+
+# Mini‑OS übergibt automatisch "parent"
+app = CalculatorGUI(parent)
