@@ -6,7 +6,7 @@ import sys
 from decimal import Decimal, getcontext, Context, DivisionByZero
 from fractions import Fraction
 
-# Allowed operators mapping
+# Allowed operators mapping (we'll handle Pow specially)
 OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -14,13 +14,12 @@ OPS = {
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
+    # ast.Pow: operator.pow,  # handled explicitly
     ast.USub: operator.neg,
     ast.UAdd: lambda x: x,
 }
 
-# Whitelisted functions (names -> callable)
-# Note: Some functions behave differently depending on numeric mode.
+# Whitelisted functions (names -> callable for float mode)
 _MATH_FUNCS = {
     "sin": math.sin,
     "cos": math.cos,
@@ -51,6 +50,7 @@ def _to_decimal(value, ctx: Context = None):
     if isinstance(value, Fraction):
         return Decimal(value.numerator) / Decimal(value.denominator)
     # ints and floats
+    # Use string conversion to avoid binary float artifacts
     return Decimal(str(value)) if not isinstance(value, float) else Decimal(repr(value))
 
 
@@ -58,16 +58,21 @@ def _to_fraction(value):
     if isinstance(value, Fraction):
         return value
     if isinstance(value, Decimal):
-        # Convert Decimal to Fraction using as_tuple and exponent
-        tup = value.as_tuple()
-        digits = 0
-        for d in tup.digits:
-            digits = digits * 10 + d
-        exp = tup.exponent
-        if exp >= 0:
-            return Fraction(digits * (10 ** exp))
-        else:
-            return Fraction(digits, 10 ** (-exp))
+        # Fraction accepts Decimal in Python 3.11+, but to be safe use string
+        try:
+            return Fraction(str(value))
+        except Exception:
+            # fallback via as_tuple
+            t = value.as_tuple()
+            digits = 0
+            for d in t.digits:
+                digits = digits * 10 + d
+            exp = t.exponent
+            if exp >= 0:
+                return Fraction(digits * (10 ** exp))
+            else:
+                return Fraction(digits, 10 ** (-exp))
+    # ints and floats
     return Fraction(value)
 
 
@@ -75,7 +80,7 @@ def eval_expr(expr: str, mode: str = "float", precision: int | None = None):
     """
     Evaluate an arithmetic expression safely.
     mode: 'float' | 'decimal' | 'fraction'
-    precision: number of decimal places (only for decimal mode)
+    precision: number of decimal digits (only for decimal mode)
     """
 
     if mode not in ("float", "decimal", "fraction"):
@@ -93,7 +98,6 @@ def eval_expr(expr: str, mode: str = "float", precision: int | None = None):
         if mode == "float":
             return float(n)
         if mode == "fraction":
-            # Fraction accepts ints or floats
             return Fraction(n)
         # decimal
         return _to_decimal(n, ctx)
@@ -108,57 +112,69 @@ def eval_expr(expr: str, mode: str = "float", precision: int | None = None):
             return Fraction(val)
         return _to_decimal(val, ctx)
 
+    # safe wrappers for whitelisted functions per mode
     def make_function(name):
         if name not in _MATH_FUNCS:
             raise EvalError(f"Unbekannte Funktion: {name}")
         func = _MATH_FUNCS[name]
 
-        def wrapper(*args):
-            # Validate/convert args based on mode
-            if mode == "fraction":
-                # Only a small safe subset works in fraction mode
-                if name in ("abs", "max", "min", "pow"):
-                    fargs = tuple(_to_fraction(a) for a in args)
-                    # pow: if exponent is not integer, raise
-                    if name == "pow":
-                        base, exp = fargs
-                        if exp.denominator != 1:
-                            raise EvalError("pow mit nicht-ganzzahligem Exponenten in Fraction-Modus nicht erlaubt")
-                        return base ** int(exp)
-                    return getattr(__builtins__, name)(*fargs) if name in ("max", "min") else eval(name)(*fargs)
-                # other functions not supported in fraction mode
-                raise EvalError(f"Funktion {name} nicht im Fraction-Modus unterstützt")
+        # Fraction mode: only allow a few functions with Fraction semantics
+        if mode == "fraction":
+            if name == "abs":
+                return lambda *args: abs(_to_fraction(args[0]))
+            if name in ("max", "min"):
+                return lambda *args: getattr(__builtins__, name)(*[_to_fraction(a) for a in args])
+            if name == "pow":
+                def pow_frac(a, b):
+                    a_f = _to_fraction(a)
+                    b_f = _to_fraction(b)
+                    if b_f.denominator != 1:
+                        raise EvalError("pow mit nicht-ganzzahligem Exponenten in Fraction-Modus nicht erlaubt")
+                    return a_f ** int(b_f)
+                return pow_frac
+            # others not supported
+            raise EvalError(f"Funktion {name} nicht im Fraction-Modus unterstützt")
 
-            if mode == "decimal":
-                # For Decimal mode: use Decimal-aware sqrt and pow where possible
-                if name == "sqrt":
-                    # use context sqrt
+        # Decimal mode: convert args to Decimal where possible
+        if mode == "decimal":
+            if name == "sqrt":
+                def sqrt_dec(a):
+                    a_d = _to_decimal(a, ctx)
                     try:
-                        return ctx.sqrt(args[0])
+                        return ctx.sqrt(a_d)
                     except Exception:
-                        # fallback to float
-                        return _to_decimal(math.sqrt(float(args[0])), ctx)
-                if name in ("log", "ln"):
-                    return _to_decimal(math.log(float(args[0])), ctx)
-                if name in ("sin", "cos", "tan"):
-                    return _to_decimal(func(float(args[0])), ctx)
-                if name == "pow":
-                    # Decimal pow may fail for non-integer exponents
-                    a, b = args
-                    # if exponent is integer, use **
-                    if isinstance(b, Decimal) and b == b.to_integral_value():
-                        return a ** int(b)
+                        # fallback to float sqrt
+                        return _to_decimal(math.sqrt(float(a_d)), ctx)
+                return sqrt_dec
+
+            if name in ("log", "ln"):
+                return lambda a: _to_decimal(math.log(float(_to_decimal(a, ctx))), ctx)
+
+            if name in ("sin", "cos", "tan"):
+                return lambda a: _to_decimal(func(float(_to_decimal(a, ctx))), ctx)
+
+            if name == "pow":
+                def pow_dec(a, b):
+                    a_d = _to_decimal(a, ctx)
+                    b_d = _to_decimal(b, ctx)
+                    # if exponent integral, use Decimal ** int
+                    try:
+                        if b_d == b_d.to_integral_value():
+                            return a_d ** int(b_d)
+                    except Exception:
+                        pass
                     # fallback via float
-                    return _to_decimal(math.pow(float(a), float(b)), ctx)
-                if name in ("max", "min"):
-                    return type(args[0])(max(*[float(a) for a in args])) if False else max(args)
-                # default: call via float and convert
-                return _to_decimal(func(float(args[0])), ctx) if len(args) == 1 else _to_decimal(func(*[float(a) for a in args]), ctx)
+                    return _to_decimal(math.pow(float(a_d), float(b_d)), ctx)
+                return pow_dec
 
-            # float mode
-            return func(*[float(a) for a in args]) if name in ("sin", "cos", "tan", "log", "ln", "sqrt", "pow") else func(*args)
+            if name in ("max", "min"):
+                return lambda *args: getattr(__builtins__, name)(*[_to_decimal(a, ctx) for a in args])
 
-        return wrapper
+            # default single-arg functions via float->Decimal
+            return lambda *args: _to_decimal(func(*[float(_to_decimal(a, ctx)) for a in args]), ctx)
+
+        # float mode
+        return lambda *args: func(*[float(a) for a in args])
 
     def _eval(node):
         # Constants (py3.8+: ast.Constant, older: ast.Num)
@@ -171,8 +187,33 @@ def eval_expr(expr: str, mode: str = "float", precision: int | None = None):
 
         if isinstance(node, ast.BinOp):
             op_type = type(node.op)
+            # Handle power separately for better control
+            if op_type is ast.Pow:
+                left = _eval(node.left)
+                right = _eval(node.right)
+                # Fraction mode: exponent must be integer
+                if mode == "fraction":
+                    l = _to_fraction(left)
+                    r = _to_fraction(right)
+                    if r.denominator != 1:
+                        raise EvalError("pow mit nicht-ganzzahligem Exponenten in Fraction-Modus nicht erlaubt")
+                    return l ** int(r)
+                if mode == "decimal":
+                    a_d = _to_decimal(left, ctx)
+                    b_d = _to_decimal(right, ctx)
+                    try:
+                        if b_d == b_d.to_integral_value():
+                            return a_d ** int(b_d)
+                    except Exception:
+                        pass
+                    # fallback to math.pow
+                    return _to_decimal(math.pow(float(a_d), float(b_d)), ctx)
+                # float
+                return math.pow(float(left), float(right))
+
             if op_type not in OPS:
                 raise EvalError("Nicht unterstützter Operator")
+
             left = _eval(node.left)
             right = _eval(node.right)
             func = OPS[op_type]
@@ -180,24 +221,17 @@ def eval_expr(expr: str, mode: str = "float", precision: int | None = None):
                 return func(left, right)
             except ZeroDivisionError:
                 raise
-            except Exception as e:
-                # Handle mixing types for Decimal/Fraction
+            except Exception:
+                # Try converting operands appropriately
                 if mode == "decimal":
-                    # try converting operands to Decimal
                     l = _to_decimal(left, ctx)
                     r = _to_decimal(right, ctx)
-                    try:
-                        return func(l, r)
-                    except Exception:
-                        raise EvalError(str(e))
+                    return func(l, r)
                 if mode == "fraction":
                     l = _to_fraction(left)
                     r = _to_fraction(right)
-                    try:
-                        return func(l, r)
-                    except Exception:
-                        raise EvalError(str(e))
-                raise EvalError(str(e))
+                    return func(l, r)
+                raise EvalError("Fehler bei Operation")
 
         if isinstance(node, ast.UnaryOp):
             op_type = type(node.op)
