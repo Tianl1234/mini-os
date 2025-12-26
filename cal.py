@@ -509,4 +509,4 @@ class CalculatorApp:
 # ============================================================
 
 # Mini‑OS übergibt automatisch "parent"
-app = CalculatorGUI(parent)
+app = CalculatorApp(parent)
